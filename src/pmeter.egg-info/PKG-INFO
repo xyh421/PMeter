@@ -1,3 +1,11 @@
+Metadata-Version: 2.4
+Name: pmeter
+Version: 0.1.0
+Summary: A Python-first API performance testing tool inspired by JMeter and Locust.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: requests>=2.31.0
+
 # PMeter
 
 PMeter 是一个用 Python 编写场景的接口性能测试工具，使用方式更接近 Locust，但目标是逐步补齐 JMeter 常见的接口压测能力。
