@@ -128,7 +128,7 @@ def check_stock(self):
 ### HTML 报告
 
 ```bash
-pmeter run scene.py --users 50 --run-time 1m --html-report report.html
+pmeter run examples/demo_scenario.py --users 50 --run-time 1m --html-report report.html
 ```
 
 生成自包含 HTML 文件，含响应时间图表、请求统计表、检查点表格。
@@ -137,7 +137,7 @@ pmeter run scene.py --users 50 --run-time 1m --html-report report.html
 
 ```bash
 # 本机 4 个进程，每进程 25 用户，合计 100 并发
-pmeter run scene.py --users 100 --workers 4 --run-time 2m
+pmeter run examples/demo_scenario.py --users 100 --workers 4 --run-time 2m
 ```
 
 Worker 进程自动平分用户数，结果合并后统一报告。
@@ -145,7 +145,7 @@ Worker 进程自动平分用户数，结果合并后统一报告。
 ### Web UI 实时面板
 
 ```bash
-pmeter run scene.py --users 20 --run-time 60s --web-ui --web-port 8089
+pmeter run examples/demo_scenario.py --users 20 --run-time 60s --web-ui --web-port 8089
 ```
 
 测试过程中打开 http://localhost:8089 可查看实时 RPS、延迟曲线、错误率。
