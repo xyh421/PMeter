@@ -9,7 +9,7 @@ description = "A Python-first API performance testing tool inspired by JMeter an
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "requests>=2.31.0",
+    "aiohttp>=3.9",
 ]
 
 [project.scripts]

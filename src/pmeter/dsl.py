@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import random
-import time
 from typing import Callable
 
 
@@ -66,10 +67,14 @@ class User:
     def on_stop(self) -> None:
         pass
 
-    def sleep(self) -> None:
-        time.sleep(self.wait_time())
+    async def sleep(self) -> None:
+        await asyncio.sleep(self.wait_time())
 
-    def run_next_task(self) -> None:
+    async def run_next_task(self) -> None:
         if not self._task_cache:
             raise RuntimeError(f"{self.__class__.__name__} has no @task methods")
-        random.choice(self._task_cache)()
+        fn = random.choice(self._task_cache)
+        if inspect.iscoroutinefunction(fn):
+            await fn()
+        else:
+            fn()

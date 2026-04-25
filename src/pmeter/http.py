@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import re
-import time
 from contextlib import suppress
-from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.parse import urljoin
 
-import requests
+import aiohttp
 
 from pmeter.stats import StatsCollector
 
@@ -16,78 +16,77 @@ class HttpAssertionError(AssertionError):
     pass
 
 
-@dataclass(slots=True)
 class HttpResponse:
-    raw: requests.Response
-    elapsed_ms: float
-    request_name: str
-    stats: StatsCollector
-    _assertion_failed: bool = False
+    """Wraps an aiohttp response with timing, assertions, and extractors."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        text: str,
+        headers: dict[str, str],
+        cookies: dict[str, str],
+        elapsed_ms: float,
+        request_name: str,
+        stats: StatsCollector,
+    ) -> None:
+        self.status_code = status_code
+        self.text = text
+        self.elapsed_ms = elapsed_ms
+        self.request_name = request_name
+        self._headers = headers
+        self._cookies = cookies
+        self._stats = stats
+        self._assertion_failed = False
 
     @property
-    def status_code(self) -> int:
-        return self.raw.status_code
-
-    @property
-    def text(self) -> str:
-        return self.raw.text
-
-    @property
-    def headers(self) -> requests.structures.CaseInsensitiveDict[str]:
-        return self.raw.headers
+    def headers(self) -> dict[str, str]:
+        return self._headers
 
     def json(self) -> Any:
-        return self.raw.json()
+        import json
+        return json.loads(self.text)
 
-    # ---- Assertions ----
+    # ---- Assertions (chainable) ----
 
     def assert_status(self, expected: int) -> "HttpResponse":
         if self.status_code != expected:
-            error = HttpAssertionError(
-                f"expected status {expected}, got {self.status_code}"
-            )
-            self._mark_assertion_failure(error)
-            raise error
+            err = HttpAssertionError(f"expected status {expected}, got {self.status_code}")
+            self._mark_failure(err)
+            raise err
         return self
 
     def assert_body_contains(self, expected: str) -> "HttpResponse":
         if expected not in self.text:
-            error = HttpAssertionError(f"response body does not contain {expected!r}")
-            self._mark_assertion_failure(error)
-            raise error
+            err = HttpAssertionError(f"response body does not contain {expected!r}")
+            self._mark_failure(err)
+            raise err
         return self
 
     def assert_json_path(self, path: str, expected: Any) -> "HttpResponse":
         actual = self._read_json_path(path)
         if actual != expected:
-            error = HttpAssertionError(
+            err = HttpAssertionError(
                 f"expected json path {path!r} to be {expected!r}, got {actual!r}"
             )
-            self._mark_assertion_failure(error)
-            raise error
+            self._mark_failure(err)
+            raise err
         return self
 
     # ---- Extractors (关联提取) ----
 
     def extract_regex(self, pattern: str, group: int = 1) -> str | None:
-        """Extract a value from the response body using a regex.
-
-        Returns ``None`` if the pattern does not match.
-        """
-        match = re.search(pattern, self.text)
-        return match.group(group) if match else None
+        m = re.search(pattern, self.text)
+        return m.group(group) if m else None
 
     def extract_json_path(self, path: str) -> Any:
-        """Extract a value from the JSON body using dot-notation path."""
         return self._read_json_path(path)
 
     def extract_header(self, name: str) -> str | None:
-        """Return the value of a response header, or ``None``."""
-        return self.headers.get(name)
+        return self._headers.get(name.lower())
 
     def extract_cookie(self, name: str) -> str | None:
-        """Return the value of a response cookie, or ``None``."""
-        return self.raw.cookies.get(name)
+        return self._cookies.get(name)
 
     # ---- Internal ----
 
@@ -100,15 +99,12 @@ class HttpResponse:
                 current = current[segment]
         return current
 
-    def _mark_assertion_failure(self, error: Exception) -> None:
+    def _mark_failure(self, error: Exception) -> None:
         if self._assertion_failed:
             return
         self._assertion_failed = True
-        self.stats.reclassify_success_as_failure(
-            self.request_name,
-            self.elapsed_ms,
-            self.status_code,
-            error,
+        self._stats.reclassify_success_as_failure(
+            self.request_name, self.elapsed_ms, self.status_code, error
         )
 
 
@@ -119,18 +115,23 @@ class HttpClient:
         host: str | None,
         pre_processors: list[Callable] | None = None,
         post_processors: list[Callable] | None = None,
-    ):
+    ) -> None:
         self.environment = environment
         self.host = host
-        self.session = requests.Session()
         self._pre: list[Callable] = pre_processors or []
         self._post: list[Callable] = post_processors or []
+        self._session: aiohttp.ClientSession | None = None
 
-    def close(self) -> None:
-        with suppress(Exception):
-            self.session.close()
+    async def _session_(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
 
-    def request(
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def request(
         self,
         method: str,
         url: str,
@@ -139,51 +140,66 @@ class HttpClient:
         timeout: float = 30.0,
         **kwargs: Any,
     ) -> HttpResponse:
+        import time
         target = self._build_url(url)
         request_name = name or f"{method.upper()} {url}"
 
         # Pre-processors
         for fn in self._pre:
-            result = fn(method, url, kwargs)
+            result = await fn(method, url, kwargs) if inspect.iscoroutinefunction(fn) else fn(method, url, kwargs)
             if isinstance(result, dict):
                 kwargs = result
 
+        session = await self._session_()
+        timeout_obj = aiohttp.ClientTimeout(total=timeout)
+
         started = time.perf_counter()
         try:
-            raw = self.session.request(method=method, url=target, timeout=timeout, **kwargs)
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            response = HttpResponse(
-                raw=raw,
-                elapsed_ms=elapsed_ms,
-                request_name=request_name,
-                stats=self.environment.stats,
-            )
-            self.environment.stats.record_success(request_name, elapsed_ms, raw.status_code)
+            async with session.request(method, target, timeout=timeout_obj, **kwargs) as raw:
+                text = await raw.text()
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                status_code = raw.status
+                headers = {k.lower(): v for k, v in raw.headers.items()}
+                cookies = {k: v.value for k, v in raw.cookies.items()}
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - started) * 1000
             self.environment.stats.record_failure(request_name, elapsed_ms, exc)
             raise
 
+        self.environment.stats.record_success(request_name, elapsed_ms, status_code)
+        response = HttpResponse(
+            status_code=status_code,
+            text=text,
+            headers=headers,
+            cookies=cookies,
+            elapsed_ms=elapsed_ms,
+            request_name=request_name,
+            stats=self.environment.stats,
+        )
+
         # Post-processors
         for fn in self._post:
-            fn(response)
+            if inspect.iscoroutinefunction(fn):
+                await fn(response)
+            else:
+                fn(response)
 
         return response
 
-    def get(self, url: str, **kwargs: Any) -> HttpResponse:
-        return self.request("GET", url, **kwargs)
+    async def get(self, url: str, **kwargs: Any) -> HttpResponse:
+        return await self.request("GET", url, **kwargs)
 
-    def post(self, url: str, **kwargs: Any) -> HttpResponse:
-        return self.request("POST", url, **kwargs)
+    async def post(self, url: str, **kwargs: Any) -> HttpResponse:
+        return await self.request("POST", url, **kwargs)
 
-    def put(self, url: str, **kwargs: Any) -> HttpResponse:
-        return self.request("PUT", url, **kwargs)
+    async def put(self, url: str, **kwargs: Any) -> HttpResponse:
+        return await self.request("PUT", url, **kwargs)
 
-    def patch(self, url: str, **kwargs: Any) -> HttpResponse:
-        return self.request("PATCH", url, **kwargs)
+    async def patch(self, url: str, **kwargs: Any) -> HttpResponse:
+        return await self.request("PATCH", url, **kwargs)
 
-    def delete(self, url: str, **kwargs: Any) -> HttpResponse:
-        return self.request("DELETE", url, **kwargs)
+    async def delete(self, url: str, **kwargs: Any) -> HttpResponse:
+        return await self.request("DELETE", url, **kwargs)
 
     def _build_url(self, url: str) -> str:
         if url.startswith("http://") or url.startswith("https://"):

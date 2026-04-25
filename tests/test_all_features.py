@@ -5,6 +5,7 @@ Runs without network access using a local mock HTTP server.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
 import sys
@@ -25,6 +26,15 @@ from pmeter.processors import post_processor, pre_processor
 from pmeter.report import generate_html_report
 from pmeter.runner import Environment, HttpUser, RunResult, run
 from pmeter.stats import CheckEntry, StatsCollector
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def arun(coro):
+    """Run a coroutine in a fresh event loop (for sync tests)."""
+    return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +100,10 @@ def env(mock_server):
 
 @pytest.fixture
 def client(env):
-    return HttpClient(env, env.host)
+    """Return an HttpClient whose async methods can be called via arun()."""
+    c = HttpClient(env, env.host)
+    yield c
+    arun(c.close())
 
 
 def _free_port() -> int:
@@ -119,7 +132,7 @@ class TestCsvDataSet:
         ds = CsvDataSet(f)
         assert ds.next_row() == {"x": "1"}
         assert ds.next_row() == {"x": "2"}
-        assert ds.next_row() == {"x": "1"}  # wraps back
+        assert ds.next_row() == {"x": "1"}
 
     def test_thread_safe(self, tmp_path):
         f = tmp_path / "data.csv"
@@ -170,8 +183,8 @@ class TestCsvDataSet:
                     self.row = users_csv.next_row()
 
                 @task(1)
-                def do(self):
-                    self.client.get("/status/200")
+                async def do(self):
+                    await self.client.get("/status/200")
         """))
         result = run(scene, users=3, spawn_rate=3.0, run_time=1.5)
         assert result.totals["requests"] > 0
@@ -207,12 +220,12 @@ class TestProcessors:
                 return kwargs
 
             @task(1)
-            def do(self):
-                self.client.get("/status/200")
+            async def do(self):
+                await self.client.get("/status/200")
 
         user = MyUser(env)
         assert len(user.client._pre) == 1
-        user.client.get("/status/200")
+        arun(user.client.get("/status/200"))
         assert injected == ["GET"]
 
     def test_post_processor_called_with_response(self, env):
@@ -226,11 +239,11 @@ class TestProcessors:
                 seen.append(response.status_code)
 
             @task(1)
-            def do(self):
-                self.client.get("/status/200")
+            async def do(self):
+                await self.client.get("/status/200")
 
         user = MyUser(env)
-        user.client.get("/status/200")
+        arun(user.client.get("/status/200"))
         assert seen == [200]
 
     def test_multiple_processors(self, env):
@@ -254,11 +267,11 @@ class TestProcessors:
                 order.append("post1")
 
             @task(1)
-            def do(self):
-                self.client.get("/status/200")
+            async def do(self):
+                await self.client.get("/status/200")
 
         user = MyUser(env)
-        user.client.get("/status/200")
+        arun(user.client.get("/status/200"))
         assert "pre1" in order
         assert "pre2" in order
         assert "post1" in order
@@ -270,34 +283,34 @@ class TestProcessors:
 
 class TestExtractors:
     def test_extract_json_path(self, client):
-        resp = client.get("/json")
+        resp = arun(client.get("/json"))
         assert resp.extract_json_path("slideshow.author") == "Yours Truly"
         assert resp.extract_json_path("slideshow.items.1") == 2
 
     def test_extract_regex_match(self, client):
-        resp = client.get("/json")
+        resp = arun(client.get("/json"))
         match = resp.extract_regex(r'"author":\s*"([^"]+)"')
         assert match == "Yours Truly"
 
     def test_extract_regex_no_match(self, client):
-        resp = client.get("/json")
+        resp = arun(client.get("/json"))
         assert resp.extract_regex(r"NOPE(\d+)") is None
 
     def test_extract_header(self, client):
-        resp = client.get("/json")
-        ct = resp.extract_header("Content-Type")
+        resp = arun(client.get("/json"))
+        ct = resp.extract_header("content-type")
         assert ct is not None and "json" in ct.lower()
 
     def test_extract_header_missing(self, client):
-        resp = client.get("/json")
-        assert resp.extract_header("X-Does-Not-Exist") is None
+        resp = arun(client.get("/json"))
+        assert resp.extract_header("x-does-not-exist") is None
 
     def test_extract_cookie(self, client):
-        resp = client.get("/set-cookie")
+        resp = arun(client.get("/set-cookie"))
         assert resp.extract_cookie("session") == "abc123"
 
     def test_extract_cookie_missing(self, client):
-        resp = client.get("/json")
+        resp = arun(client.get("/json"))
         assert resp.extract_cookie("nosuchcookie") is None
 
     def test_correlation_via_vars(self, env):
@@ -305,12 +318,12 @@ class TestExtractors:
             host = env.host
 
             @task(1)
-            def flow(self):
-                resp = self.client.get("/token")
+            async def flow(self):
+                resp = await self.client.get("/token")
                 self.vars["token"] = resp.extract_json_path("access_token")
 
         user = TokenUser(env)
-        user.flow()
+        arun(user.flow())
         assert user.vars["token"] == "tok-xyz-789"
 
 
@@ -357,8 +370,8 @@ class TestCheckpoints:
                 wait_time = constant(0)
 
                 @task(1)
-                def do(self):
-                    resp = self.client.get("/json")
+                async def do(self):
+                    resp = await self.client.get("/json")
                     data = resp.json()
                     self.check("has_author", "author" in data["slideshow"])
                     self.check("always_fail", False, message="intentional")
@@ -398,8 +411,7 @@ class TestHtmlReport:
     def test_html_contains_pmeter_title(self, tmp_path):
         result = self._make_result()
         out = generate_html_report(result, tmp_path / "report.html")
-        html = out.read_text()
-        assert "PMeter Report" in html
+        assert "PMeter Report" in out.read_text()
 
     def test_html_contains_request_names(self, tmp_path):
         result = self._make_result()
@@ -418,8 +430,7 @@ class TestHtmlReport:
     def test_html_contains_chart_js(self, tmp_path):
         result = self._make_result()
         out = generate_html_report(result, tmp_path / "report.html")
-        html = out.read_text()
-        assert "chart.js" in html.lower()
+        assert "chart.js" in out.read_text().lower()
 
     def test_xss_escaping(self, tmp_path):
         stats = StatsCollector()
@@ -466,7 +477,7 @@ class TestDistributed:
         r2 = make([150.0, 250.0], 2)
         merged = _merge_results([r1, r2])
         entry = {e.name: e for e in merged.stats}["GET /x"]
-        assert entry.requests == 4 + 3  # 2 successes + 1 failure each = 3 per result = 6 + extra
+        assert entry.requests == 4 + 3
         assert entry.failures == 3
         assert merged.duration_seconds == 5.0
 
@@ -505,8 +516,8 @@ class TestDistributed:
                 wait_time = constant(0)
 
                 @task(1)
-                def do(self):
-                    self.client.get("/status/200")
+                async def do(self):
+                    await self.client.get("/status/200")
         """))
         from pmeter.distributed import run_distributed
         result = run_distributed(
@@ -566,7 +577,7 @@ class TestWebUI:
         ui = WebUIServer(env, port=port)
         ui.start()
         time.sleep(0.2)
-        env.stop_event.set()  # signal test complete
+        env.stop_event.set()
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats") as r:
                 data = json.loads(r.read())
@@ -608,16 +619,16 @@ class TestIntegration:
                     pass
 
                 @task(1)
-                def json_task(self):
-                    resp = self.client.get("/json")
+                async def json_task(self):
+                    resp = await self.client.get("/json")
                     author = resp.extract_json_path("slideshow.author")
                     self.vars["author"] = author
                     self.check("author_set", author is not None)
                     self.check("status_ok", resp.status_code == 200)
 
                 @task(1)
-                def token_task(self):
-                    resp = self.client.get("/token")
+                async def token_task(self):
+                    resp = await self.client.get("/token")
                     tok = resp.extract_json_path("access_token")
                     self.vars["token"] = tok
                     self.check("token_starts_tok", tok.startswith("tok-"))
